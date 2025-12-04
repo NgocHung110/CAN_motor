@@ -1,0 +1,15 @@
+# Ignore ESP-IDF build output
+/build/
+
+# Ignore sdkconfig backup
+/sdkconfig.old
+
+# VS Code settings
+.vscode/
+
+# CLion / JetBrains IDE settings
+.idea/
+
+# Mac / Linux / Windows system files
+.DS_Store
+Thumbs.db
