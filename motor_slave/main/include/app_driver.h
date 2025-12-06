@@ -19,8 +19,8 @@
 #define ENC_ANGLE_MAX       180
 
 // -------- CAN (ESP32C3 -> MCP2551) --------
-#define CAN_TX_PIN          GPIO_NUM_18
-#define CAN_RX_PIN          GPIO_NUM_19
+#define CAN_TX_PIN          GPIO_NUM_2
+#define CAN_RX_PIN          GPIO_NUM_3
 
 // ================== DRIVER CONFIG STRUCT ==================
 typedef struct {

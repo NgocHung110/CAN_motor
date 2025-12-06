@@ -1,12 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <math.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"
-#include "freertos/semphr.h"
-#include "freertos/timers.h"
 
 #include "esp_log.h"
 
@@ -16,31 +12,13 @@
 
 static const char *TAG = "SLAVE_APP";
 
-// ================== Control parameters ==================
-#define CONTROL_PERIOD_MS   10
-#define FEEDBACK_PERIOD_MS  50
-#define ANGLE_DEADBAND_DEG  2
-#define KP_SPEED            10.0f
-
-// ================== RTOS Objects ==================
-static QueueHandle_t     s_setpoint_queue = NULL;
-static SemaphoreHandle_t s_angle_mutex    = NULL;
-static TimerHandle_t     s_feedback_timer = NULL;
-
-// ================== Shared state ==================
-static int16_t g_setpoint_angle = 0;
-static int16_t g_current_angle  = 0;
-
-// ================== Forward Declaration ==================
-static void task_control(void *arg);
-static void task_can_rx(void *arg);
-static void feedback_timer_cb(TimerHandle_t xTimer);
+void task_can_rx(void *arg);
 
 // ================== app_main ==================
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "SLAVE node starting...");
+    ESP_LOGI(TAG, "SLAVE node starting (motor driver only)...");
 
     // ====== GET PIN FROM HEADER ======
     app_driver_config_t cfg = {
@@ -48,8 +26,8 @@ void app_main(void)
         .motor_forward_pin  = MOTOR_FWD_PIN,
         .motor_backward_pin = MOTOR_BWD_PIN,
 
-        .enc_clk_pin        = ENC_CLK_PIN,
-        .enc_dt_pin         = ENC_DT_PIN,
+        .enc_clk_pin        = ENC_CLK_PIN,      // encoder không dùng nữa,
+        .enc_dt_pin         = ENC_DT_PIN,       // nhưng vẫn có thể giữ nguyên
         .enc_sw_pin         = ENC_SW_PIN,
         .enc_reverse_dir    = ENC_REVERSE_DIR,
         .enc_angle_min      = ENC_ANGLE_MIN,
@@ -60,102 +38,43 @@ void app_main(void)
     };
 
     // ====== INIT HARDWARE ======
-    app_driver_init(&cfg);
- // ====== CREATE RTOS OBJECTS ======
-    s_setpoint_queue = xQueueCreate(1, sizeof(int16_t));
-    s_angle_mutex    = xSemaphoreCreateMutex();
+    app_driver_init(&cfg);   // Khởi tạo CAN + motor (+ encoder nếu bạn vẫn để)
 
-    s_feedback_timer = xTimerCreate(
-        "fb_timer",
-        pdMS_TO_TICKS(FEEDBACK_PERIOD_MS),
-        pdTRUE,
-        NULL,
-        feedback_timer_cb
-    );
-    xTimerStart(s_feedback_timer, 0);
+    // ====== Create CAN RX Task ======
+    xTaskCreate(task_can_rx, "CAN_RX_TASK", 4096, NULL, 5, NULL);
 
-    // ====== Create tasks ======
-    xTaskCreate(task_control, "CTRL_TASK",   4096, NULL, 5, NULL);
-    xTaskCreate(task_can_rx,  "CAN_RX_TASK", 4096, NULL, 6, NULL);
-
-    ESP_LOGI(TAG, "SLAVE app started (tasks + timer running)");
+    ESP_LOGI(TAG, "SLAVE app started (CAN RX task running)");
 }
 
-// ================== FEEDBACK TIMER CALLBACK ==================
+// ================== TASK: CAN RX (nhận lệnh motor) ==================
 
-static void feedback_timer_cb(TimerHandle_t xTimer)
-{
-    (void)xTimer;
-
-    int16_t angle;
-    if (xSemaphoreTake(s_angle_mutex, 0) == pdTRUE) {
-        angle = g_current_angle;
-        xSemaphoreGive(s_angle_mutex);
-    } else {
-        return;
-    }
-
-    can_driver_send_feedback(angle);
-}
-
-// ================== TASK: CAN RX (nhận setpoint) ==================
-
-static void task_can_rx(void *arg)
+void task_can_rx(void *arg)
 {
     (void)arg;
     twai_message_t msg;
 
+    ESP_LOGI(TAG, "CAN RX task started, waiting for motor commands...");
+
     while (1) {
         if (can_driver_receive(&msg, portMAX_DELAY) == ESP_OK) {
-            if (!msg.rtr && !msg.extd &&
-                msg.identifier == CAN_ID_SETPOINT &&
-                msg.data_length_code >= 2)
-            {
-                int16_t sp = (int16_t)((((int16_t)msg.data[1]) << 8) | msg.data[0]);
-                xQueueOverwrite(s_setpoint_queue, &sp);
-                ESP_LOGI(TAG, "Received setpoint = %d deg", sp);
+            bool dir;
+            uint16_t duty;
+
+            if (can_driver_parse_motor_cmd(&msg, &dir, &duty) == ESP_OK) {
+                if (duty == 0) {
+                    motor_stop();
+                    ESP_LOGI(TAG, "Motor STOP");
+                } else {
+                    motor_set_direction(dir);
+                    motor_set_speed(duty);
+                    ESP_LOGI(TAG, "Motor CMD: dir=%d, duty=%u",
+                             (int)dir, (unsigned)duty);
+                }
+            } else {
+                // Không phải frame MOTOR_CMD, có thể log debug nếu cần
+                ESP_LOGD(TAG, "Received non-motor frame: ID=0x%03X, DLC=%d",
+                         msg.identifier, msg.data_length_code);
             }
         }
-    }
-}
-
-// ================== TASK: CONTROL ==================
-
-static void task_control(void *arg)
-{
-    (void)arg;
-    int16_t local_sp = 0;
-
-    while (1) {
-        // Lấy setpoint mới nhất
-        int16_t sp;
-        while (xQueueReceive(s_setpoint_queue, &sp, 0) == pdPASS) {
-            local_sp = sp;
-        }
-
-        // Đọc góc hiện tại
-        int16_t angle = app_driver_get_encoder_angle();
-
-        // Cập nhật biến global
-        if (xSemaphoreTake(s_angle_mutex, portMAX_DELAY) == pdTRUE) {
-            g_current_angle  = angle;
-            g_setpoint_angle = local_sp;
-            xSemaphoreGive(s_angle_mutex);
-        }
-
-        // Điều khiển motor bám góc
-        int16_t error   = local_sp - angle;
-        int16_t abs_err = abs(error);
-
-        if (abs_err <= ANGLE_DEADBAND_DEG) {
-            motor_stop();
-        } else {
-            motor_set_direction(error > 0);
-            uint32_t duty = (uint32_t)(KP_SPEED * abs_err);
-            if (duty > 8191) duty = 8191;
-            motor_set_speed(duty);
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(CONTROL_PERIOD_MS));
     }
 }

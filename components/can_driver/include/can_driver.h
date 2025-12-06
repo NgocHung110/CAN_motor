@@ -4,14 +4,16 @@
 #include "esp_err.h"
 #include "driver/twai.h"
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 // ===== Protocol ID dùng chung cho Master/Slave =====
-#define CAN_ID_SETPOINT   0x101   // Master -> Slave: góc mong muốn
-#define CAN_ID_FEEDBACK   0x102   // Slave  -> Master: góc hiện tại
+#define CAN_ID_SETPOINT    0x101   // (KHÔNG dùng nữa, để đó nếu cần)
+#define CAN_ID_FEEDBACK    0x102   // (KHÔNG dùng nữa, để đó nếu cần)
+#define CAN_ID_MOTOR_CMD   0x103   // Master -> Slave: lệnh motor (dir + duty)
 
 /**
  * @brief Khởi tạo TWAI (CAN) cho ESP32-C3
@@ -30,15 +32,24 @@ esp_err_t can_driver_transmit(const twai_message_t *msg);
  */
 esp_err_t can_driver_receive(twai_message_t *msg, TickType_t timeout);
 
-/**
- * @brief Gửi góc setpoint (Master -> Slave)
- */
+/* ========== Cũ (góc setpoint/feedback) – có thể bỏ nếu không dùng ========== */
 esp_err_t can_driver_send_setpoint(int16_t angle);
+esp_err_t can_driver_send_feedback(int16_t angle);
+
+/* ========== MỚI: Lệnh motor (Master -> Slave) ========== */
+/**
+ * Byte 0: dir  (0 = backward, 1 = forward)
+ * Byte 1: duty LSB (0–1023)
+ * Byte 2: duty MSB
+ */
+esp_err_t can_driver_send_motor_cmd(bool dir, uint16_t duty);
 
 /**
- * @brief Gửi góc feedback (Slave -> Master)
+ * Parse frame lệnh motor
  */
-esp_err_t can_driver_send_feedback(int16_t angle);
+esp_err_t can_driver_parse_motor_cmd(const twai_message_t *msg,
+                                     bool *dir,
+                                     uint16_t *duty);
 
 #ifdef __cplusplus
 }

@@ -31,6 +31,8 @@ esp_err_t can_driver_receive(twai_message_t *msg, TickType_t timeout)
     return twai_receive(msg, timeout);
 }
 
+/* ========= Legacy helpers (có thể bỏ nếu không dùng) ========= */
+
 esp_err_t can_driver_send_setpoint(int16_t angle)
 {
     twai_message_t msg = {0};
@@ -55,4 +57,51 @@ esp_err_t can_driver_send_feedback(int16_t angle)
     msg.data[1] = (uint8_t)((angle >> 8) & 0xFF);
 
     return can_driver_transmit(&msg);
+}
+
+/* ================= NEW API: MOTOR COMMAND ================= */
+// Byte 0: dir (0 = backward, 1 = forward)
+// Byte 1: duty LSB
+// Byte 2: duty MSB
+esp_err_t can_driver_send_motor_cmd(bool dir, uint16_t duty)
+{
+    if (duty > 1023) {
+        duty = 1023;
+    }
+
+    twai_message_t msg = {0};
+    msg.identifier       = CAN_ID_MOTOR_CMD;
+    msg.extd             = 0;
+    msg.rtr              = 0;
+    msg.data_length_code = 3;
+
+    msg.data[0] = dir ? 1 : 0;
+    msg.data[1] = (uint8_t)(duty & 0xFF);        // LSB
+    msg.data[2] = (uint8_t)((duty >> 8) & 0xFF); // MSB
+
+    return can_driver_transmit(&msg);
+}
+
+esp_err_t can_driver_parse_motor_cmd(const twai_message_t *msg,
+                                     bool *dir,
+                                     uint16_t *duty)
+{
+    if (!msg || !dir || !duty) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (msg->identifier != CAN_ID_MOTOR_CMD ||
+        msg->extd != 0 ||
+        msg->rtr  != 0 ||
+        msg->data_length_code < 3)
+    {
+        return ESP_FAIL;
+    }
+
+    *dir  = (msg->data[0] != 0);
+    *duty = (uint16_t)msg->data[1] | ((uint16_t)msg->data[2] << 8);
+    if (*duty > 1023) {
+        *duty = 1023;
+    }
+    return ESP_OK;
 }

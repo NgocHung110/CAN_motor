@@ -1,126 +1,139 @@
 #include <stdio.h>
+
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"
 
 #include "app_driver.h"
+#include "can_driver.h"
 
-#define TAG "app_main"
+#define TAG "MASTER_MAIN"
+
+#define CONTROL_PERIOD_MS      10      // 100 Hz
+#define ANGLE_DEADBAND_DEG      2      // |error| <= 4° -> stop
+#define ANGLE_FULL_SCALE_DEG  180      // dải điều khiển (0–180°)
+
+#define DUTY_MAX             1023      // 10-bit PWM
+#define DUTY_MIN              250      // duty tối thiểu để motor chạy
+#define DUTY_STEP_MAX          20      // giới hạn thay đổi duty mỗi chu kỳ
 
 // Task handles
-static TaskHandle_t s_task_can_rx = NULL;
-static TaskHandle_t s_task_encoder = NULL;
-static TaskHandle_t s_task_display = NULL;
+static TaskHandle_t s_task_control  = NULL;
+static TaskHandle_t s_task_display  = NULL;
 
-// Function prototypes
-void task_can_receive(void *pvParameters);
-void task_read_and_send_encoder(void *pvParameters);
-void task_display(void *pvParameters);
+// Task prototypes
+static void task_control(void *pvParameters);
+static void task_display(void *pvParameters);
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Starting ESP1 - MASTER Node");
-    
-    // Khởi tạo driver với chế độ MASTER
-    app_driver_init(CAN_MODE_MASTER);
-    
-    // Tạo các tasks
-    xTaskCreate(task_can_receive, "CAN_RX", 2048, NULL, 5, &s_task_can_rx);
-    xTaskCreate(task_read_and_send_encoder, "ENCODER", 2048, NULL, 4, &s_task_encoder);
-    xTaskCreate(task_display, "DISPLAY", 4096, NULL, 3, &s_task_display);
-    
-    ESP_LOGI(TAG, "All tasks created successfully");
-    
-    // Main task - chỉ giám sát
-    uint32_t tick_count = 0;
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        tick_count++;
-        
-        // Log trạng thái mỗi 5 giây
-        if (tick_count % 5 == 0) {
-            uint16_t current = app_driver_encoder_get_current();
-            uint16_t desired = app_driver_encoder_get_desired();
-            ESP_LOGI(TAG, "Status - Current: %d, Desired: %d", current, desired);
+    ESP_LOGI(TAG, "Starting ESP1 - MASTER Node (2 encoders, CAN motor cmd)");
+
+    // Khởi tạo driver cho MASTER (2 encoder + CAN + OLED)
+    if (app_driver_init() != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to init app_driver");
+        while (1) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
+
+    xTaskCreate(task_control,
+                "CTRL",  4096, NULL, 5, &s_task_control);
+
+    xTaskCreate(task_display,
+                "DISPLAY", 4096, NULL, 3, &s_task_display);
+
+    ESP_LOGI(TAG, "All tasks created successfully");
 }
 
-// Task 1: Xử lý nhận CAN message
-void task_can_receive(void *pvParameters)
+// Task CONTROL
+static void task_control(void *pvParameters)
 {
-    ESP_LOGI(TAG, "CAN Receive Task started");
-    
-    while (1) {
-        // Xử lý nhận CAN message (non-blocking)
-        app_driver_can_receive_handler();
-        
-        // Chạy ở 100Hz (10ms)
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-}
+    (void)pvParameters;
 
-// Task 2: Đọc encoder mong muốn và gửi qua CAN
-void task_read_and_send_encoder(void *pvParameters)
-{
-    uint16_t last_desired_value = 0;
-    uint16_t last_current_value = 0;
-    uint32_t send_count = 0;
-    
-    ESP_LOGI(TAG, "Encoder Task started");
-    
+    uint16_t last_duty = 0;
+    bool     last_dir  = true;
+
+    ESP_LOGI(TAG, "Control Task started");
+
     while (1) {
-        // 1. Đọc encoder mong muốn
-        uint16_t desired_value = app_driver_encoder_get_desired();
-        
-        // 2. Kiểm tra nếu giá trị thay đổi thì gửi qua CAN
-        if (desired_value != last_desired_value) {
-            esp_err_t ret = app_driver_can_send_desired_encoder(desired_value);
-            if (ret == ESP_OK) {
-                send_count++;
-                last_desired_value = desired_value;
-                
-                // Log mỗi 10 lần gửi
-                if (send_count % 10 == 0) {
-                    ESP_LOGI(TAG, "Sent %d encoder values", send_count);
+        // 1. Đọc 2 encoder
+        uint16_t desired = app_driver_encoder_get_desired(); // angle_setpoint
+        uint16_t actual  = app_driver_encoder_get_current(); // angle_actual
+
+        // 2. Tính sai số
+        int16_t error   = (int16_t)desired - (int16_t)actual;
+        int16_t abs_err = (error >= 0) ? error : -error;
+
+        bool dir  = (error > 0);  // 1 = forward, 0 = backward
+        uint16_t duty = 0;
+
+        if (abs_err <= ANGLE_DEADBAND_DEG) {
+           
+            duty = 0;
+        } else {
+            // P-control đơn giản: duty ~ |error|
+            float ratio = (float)abs_err / (float)ANGLE_FULL_SCALE_DEG;
+            if (ratio > 1.0f) ratio = 1.0f;
+
+            uint32_t d = (uint32_t)(DUTY_MIN + ratio * (float)(DUTY_MAX - DUTY_MIN));
+            if (d > DUTY_MAX) d = DUTY_MAX;
+            duty = (uint16_t)d;
+
+            // Slew-rate limit
+            if (duty > last_duty) {
+                uint16_t diff = duty - last_duty;
+                if (diff > DUTY_STEP_MAX) {
+                    duty = last_duty + DUTY_STEP_MAX;
+                }
+            } else {
+                uint16_t diff = last_duty - duty;
+                if (diff > DUTY_STEP_MAX) {
+                    duty = last_duty - DUTY_STEP_MAX;
                 }
             }
         }
-        
-        // 3. Lấy giá trị encoder hiện tại từ ESP2
-        uint16_t current_value = app_driver_encoder_get_current();
-        
-        // 4. Gửi dữ liệu vào queue nếu có thay đổi
-        if (current_value != last_current_value || desired_value != last_desired_value) {
-            if (app_driver_send_angle_data(current_value, desired_value)) {
-                last_current_value = current_value;
+
+        // 3. Chỉ gửi CAN khi dir/duty thay đổi để giảm traffic
+        if (duty != last_duty || dir != last_dir) {
+            esp_err_t ret = can_driver_send_motor_cmd(dir, duty);
+            if (ret != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to send motor cmd (dir=%d, duty=%u)",
+                         (int)dir, (unsigned)duty);
+            } else {
+                ESP_LOGD(TAG, "Send motor cmd: desired=%u, actual=%u, err=%d, dir=%d, duty=%u",
+                         desired, actual, (int)error, (int)dir, (unsigned)duty);
             }
+
+            last_duty = duty;
+            last_dir  = dir;
         }
-        
-        // Chạy ở 20Hz (50ms) - đủ nhanh cho encoder
-        vTaskDelay(pdMS_TO_TICKS(50));
+
+        // 4. Gửi dữ liệu cho task display (OLED)
+        app_driver_send_angle_data(actual, desired);
+
+        vTaskDelay(pdMS_TO_TICKS(CONTROL_PERIOD_MS));
     }
 }
 
-// Task 3: Hiển thị OLED
-void task_display(void *pvParameters)
+// Task DISPLAY
+static void task_display(void *pvParameters)
 {
+    (void)pvParameters;
+
     angle_data_t angle_data;
     uint32_t display_count = 0;
-    
+
     ESP_LOGI(TAG, "Display Task started");
-    
+
     while (1) {
         // Thử lấy dữ liệu mới từ queue (non-blocking)
         if (app_driver_try_receive_angle_data(&angle_data)) {
-            // Hiển thị dữ liệu mới
             app_driver_display_angle(angle_data.current, angle_data.desired);
             display_count++;
-            
-            // Log mỗi 20 lần hiển thị
+
             if (display_count % 20 == 0) {
-                ESP_LOGI(TAG, "Displayed %d times", display_count);
+                ESP_LOGI(TAG, "Displayed %u frames", display_count);
             }
         } else {
             // Nếu không có dữ liệu mới, vẫn cập nhật với giá trị hiện tại
@@ -128,8 +141,7 @@ void task_display(void *pvParameters)
             uint16_t desired = app_driver_encoder_get_desired();
             app_driver_display_angle(current, desired);
         }
-        
-        // Chạy ở 10Hz (100ms) - đủ mượt cho OLED
+
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
